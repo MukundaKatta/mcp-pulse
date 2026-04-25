@@ -1,109 +1,99 @@
-'use strict';
+// Rolling per-server sample store.
+//
+// Each server gets a fixed-size ring buffer of recent probe samples.
+// The store computes derived metrics on demand: uptime%, p50, p95, and
+// the last error message. Pure in-memory; no I/O.
 
-const fs = require('fs').promises;
-const path = require('path');
-const os = require('os');
-
-const DEFAULT_STORE = path.join(os.homedir(), '.mcp-health', 'history.jsonl');
-const MAX_LATENCIES_KEPT = 50;
-
-/**
- * Tiny JSONL-backed history store.
- *
- * Schema (one line per server):
- *   { name, lastOk, lastSeenStatus, failStreak, latencies: [ms,...] }
- *
- * Not thread-safe across processes; designed for one CLI process at a time.
- */
-class Store {
-  constructor(filePath = DEFAULT_STORE) {
-    this.filePath = filePath;
+export class RollingStore {
+  constructor({ window = 100 } = {}) {
+    if (!Number.isInteger(window) || window <= 0) {
+      throw new Error('RollingStore: window must be a positive integer');
+    }
+    this.window = window;
     this.byName = new Map();
   }
 
-  async load() {
-    let raw;
-    try {
-      raw = await fs.readFile(this.filePath, 'utf8');
-    } catch (e) {
-      if (e.code === 'ENOENT') return;
-      throw e;
+  record(name, sample) {
+    if (typeof name !== 'string' || !name.length) {
+      throw new Error('RollingStore.record: name must be a non-empty string');
     }
-    for (const line of raw.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const row = JSON.parse(trimmed);
-        if (row && typeof row.name === 'string') {
-          // last write wins on duplicate keys; we just keep the latest
-          this.byName.set(row.name, normalizeRow(row));
-        }
-      } catch (_e) {
-        // skip malformed lines
+    if (!sample || typeof sample !== 'object') {
+      throw new Error('RollingStore.record: sample must be an object');
+    }
+    let buf = this.byName.get(name);
+    if (!buf) {
+      buf = [];
+      this.byName.set(name, buf);
+    }
+    const entry = {
+      ts: typeof sample.ts === 'number' ? sample.ts : Date.now(),
+      ok: !!sample.ok,
+      latencyMs: Number.isFinite(sample.latencyMs) ? sample.latencyMs : null,
+      error: sample.error ?? null,
+    };
+    buf.push(entry);
+    if (buf.length > this.window) {
+      // Drop oldest samples to stay within the window.
+      buf.splice(0, buf.length - this.window);
+    }
+  }
+
+  // Return the raw samples for `name` (a copy so callers can't mutate state).
+  samples(name) {
+    const buf = this.byName.get(name);
+    return buf ? buf.slice() : [];
+  }
+
+  // Compute derived metrics for one server.
+  // Returns null if there are no samples yet.
+  summary(name) {
+    const buf = this.byName.get(name);
+    if (!buf || buf.length === 0) return null;
+
+    const total = buf.length;
+    let okCount = 0;
+    const okLatencies = [];
+    let lastError = null;
+
+    for (const s of buf) {
+      if (s.ok) {
+        okCount++;
+        if (typeof s.latencyMs === 'number') okLatencies.push(s.latencyMs);
+      } else if (s.error) {
+        lastError = s.error;
       }
     }
+
+    const uptimePct = (okCount / total) * 100;
+    const p50 = percentile(okLatencies, 50);
+    const p95 = percentile(okLatencies, 95);
+
+    return {
+      name,
+      samples: total,
+      uptimePct,
+      p50,
+      p95,
+      lastOk: buf[buf.length - 1].ok,
+      lastError,
+    };
   }
 
-  /**
-   * Update history with a fresh probe outcome and return the updated record.
-   */
-  recordProbe(name, probe) {
-    const prev = this.byName.get(name) || newRow(name);
-    const next = { ...prev };
-    if (probe.ok) {
-      next.lastOk = nowIso();
-      next.failStreak = 0;
-      if (typeof probe.latencyMs === 'number') {
-        next.latencies = [...next.latencies.slice(-(MAX_LATENCIES_KEPT - 1)), probe.latencyMs];
-      }
-    } else {
-      next.failStreak = (prev.failStreak || 0) + 1;
-    }
-    next.lastSeenStatus = probe.ok ? 'ok' : 'down';
-    next.lastError = probe.ok ? null : probe.error || 'unknown error';
-    this.byName.set(name, next);
-    return derived(next);
-  }
-
-  async save() {
-    await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-    const lines = Array.from(this.byName.values()).map((r) => JSON.stringify(r));
-    await fs.writeFile(this.filePath, lines.join('\n') + (lines.length ? '\n' : ''), 'utf8');
+  // Convenience: summaries for every known server.
+  summaries() {
+    return [...this.byName.keys()]
+      .map((n) => this.summary(n))
+      .filter(Boolean)
+      .sort((a, b) => a.name.localeCompare(b.name));
   }
 }
 
-function newRow(name) {
-  return {
-    name,
-    lastOk: null,
-    lastSeenStatus: 'unknown',
-    failStreak: 0,
-    lastError: null,
-    latencies: [],
-  };
+// Standard nearest-rank percentile. Returns null if input is empty.
+export function percentile(values, q) {
+  if (!Array.isArray(values) || values.length === 0) return null;
+  if (!Number.isFinite(q) || q < 0 || q > 100) return null;
+  const sorted = values.slice().sort((a, b) => a - b);
+  if (q === 0) return sorted[0];
+  const idx = Math.ceil((q / 100) * sorted.length) - 1;
+  return sorted[Math.max(0, Math.min(sorted.length - 1, idx))];
 }
-
-function normalizeRow(row) {
-  return {
-    ...newRow(row.name),
-    ...row,
-    latencies: Array.isArray(row.latencies) ? row.latencies.filter((n) => Number.isFinite(n)) : [],
-  };
-}
-
-function derived(row) {
-  const lats = row.latencies.slice().sort((a, b) => a - b);
-  const p = (q) => (lats.length ? lats[Math.min(lats.length - 1, Math.floor(q * lats.length))] : null);
-  return {
-    lastOk: row.lastOk,
-    failStreak: row.failStreak,
-    p50: p(0.5),
-    p95: p(0.95),
-  };
-}
-
-function nowIso() {
-  return new Date().toISOString();
-}
-
-module.exports = { Store, DEFAULT_STORE };

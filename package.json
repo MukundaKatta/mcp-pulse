@@ -1,30 +1,30 @@
 {
-  "name": "mcp-pulse",
+  "name": "@mukundakatta/mcp-pulse",
   "version": "0.1.0",
   "description": "A small, dependency-free Node.js CLI that watches a fleet of MCP (Model Context Protocol) servers and reports health, latency, and uptime.",
-  "main": "src/index.js",
+  "type": "module",
   "bin": {
-    "mcp-pulse": "src/cli.js"
+    "mcp-pulse": "src/cli.js",
+    "mp": "src/cli.js"
+  },
+  "exports": {
+    ".": "./src/index.js"
   },
   "scripts": {
-    "test": "node --test test/test_basic.js",
-    "demo": "node examples/run-and-alert.js"
+    "test": "node --test",
+    "pack:check": "npm pack --dry-run"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "keywords": [
     "mcp",
-    "model-context-protocol",
-    "health-check",
     "monitoring",
-    "ai-agents",
-    "observability",
-    "uptime",
+    "health",
     "cli"
   ],
-  "author": "Mukunda Katta <mukunda.vjcs6@gmail.com>",
+  "author": "Mukunda Katta",
   "license": "MIT",
-  "engines": {
-    "node": ">=18"
-  },
   "homepage": "https://github.com/MukundaKatta/mcp-pulse",
   "repository": {
     "type": "git",

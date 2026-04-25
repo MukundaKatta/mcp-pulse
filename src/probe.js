@@ -1,76 +1,100 @@
-'use strict';
+// MCP server probing.
+//
+// Each probe sends a JSON-RPC `initialize` request and waits for the
+// server's response. We measure wall-clock latency and report whether
+// the round trip succeeded. The function never throws: failures come
+// back as { ok: false, error }.
 
-const { spawn } = require('child_process');
-const http = require('http');
-const https = require('https');
-const { URL } = require('url');
+import { spawn } from 'node:child_process';
 
-/**
- * Probe a single MCP server. Performs a real MCP `initialize` request
- * and (best-effort) a `tools/list` request, then reports latency and
- * whether the round trip succeeded.
- *
- * The function never throws: it returns a structured result with
- * `ok: false` and an `error` string if anything goes wrong.
- *
- * @param {string} name
- * @param {object} spec  - { transport, command|url, args?, env?, headers? }
- * @param {object} opts  - { timeoutMs }
- * @returns {Promise<{ok: boolean, latencyMs: number|null, error: string|null, transport: string}>}
- */
-async function probeServer(name, spec, { timeoutMs = 5000 } = {}) {
-  const transport = spec.transport;
-  const t0 = Date.now();
-  try {
-    if (transport === 'stdio') {
-      await probeStdio(spec, timeoutMs);
-    } else if (transport === 'http') {
-      await probeHttp(spec, timeoutMs);
-    } else if (transport === 'sse') {
-      await probeSse(spec, timeoutMs);
-    } else {
-      return { ok: false, latencyMs: null, error: `unknown transport: ${transport}`, transport };
-    }
-    return { ok: true, latencyMs: Date.now() - t0, error: null, transport };
-  } catch (err) {
-    return {
-      ok: false,
-      latencyMs: Date.now() - t0,
-      error: err && err.message ? err.message : String(err),
-      transport,
-    };
+const PROTOCOL_VERSION = '2025-03-26';
+const CLIENT_INFO = { name: 'mcp-pulse', version: '0.1.0' };
+
+export async function probeServer(server, { timeoutMs } = {}) {
+  if (!server || typeof server !== 'object') {
+    return { ok: false, latencyMs: 0, error: 'probeServer: server must be an object' };
   }
+  const limit = typeof timeoutMs === 'number' && timeoutMs > 0
+    ? timeoutMs
+    : (typeof server.timeoutMs === 'number' && server.timeoutMs > 0 ? server.timeoutMs : 5000);
+
+  if (server.transport === 'stdio') {
+    return probeStdio(server, limit);
+  }
+  if (server.transport === 'http') {
+    return probeHttp(server, limit);
+  }
+  return { ok: false, latencyMs: 0, error: `unknown transport: ${server.transport}` };
 }
 
-// --- stdio probing ---------------------------------------------------------
+function buildInitRequest() {
+  return {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: {
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: {},
+      clientInfo: CLIENT_INFO,
+    },
+  };
+}
 
-function probeStdio(spec, timeoutMs) {
-  return new Promise((resolve, reject) => {
+function probeStdio(server, timeoutMs) {
+  return new Promise((resolve) => {
+    const start = performanceNow();
     let child;
     try {
-      child = spawn(spec.command, spec.args || [], {
-        env: { ...process.env, ...(spec.env || {}) },
+      child = spawn(server.command, server.args || [], {
         stdio: ['pipe', 'pipe', 'pipe'],
       });
     } catch (e) {
-      return reject(new Error(`spawn failed: ${e.message}`));
+      return resolve({
+        ok: false,
+        latencyMs: 0,
+        error: `spawn failed: ${e.message}`,
+      });
     }
 
     let buffer = '';
-    let settled = false;
-    const finish = (err) => {
-      if (settled) return;
-      settled = true;
-      try { child.kill('SIGTERM'); } catch (_) { /* noop */ }
-      err ? reject(err) : resolve();
+    let done = false;
+
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try { child.kill('SIGTERM'); } catch (_e) { /* noop */ }
+      // give it a moment, then SIGKILL if still alive
+      setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch (_e) { /* noop */ }
+      }, 250).unref();
+      resolve(result);
     };
 
-    const timer = setTimeout(() => finish(new Error(`stdio probe timed out after ${timeoutMs}ms`)), timeoutMs);
-    timer.unref && timer.unref();
+    const timer = setTimeout(() => {
+      finish({
+        ok: false,
+        latencyMs: Math.round(performanceNow() - start),
+        error: `stdio probe timed out after ${timeoutMs}ms`,
+      });
+    }, timeoutMs);
+    timer.unref?.();
 
-    child.on('error', (e) => finish(new Error(`process error: ${e.message}`)));
-    child.on('exit', (code) => {
-      if (!settled) finish(new Error(`process exited early with code ${code}`));
+    child.on('error', (e) => {
+      finish({
+        ok: false,
+        latencyMs: Math.round(performanceNow() - start),
+        error: `process error: ${e.message}`,
+      });
+    });
+
+    child.on('exit', (code, signal) => {
+      if (done) return;
+      finish({
+        ok: false,
+        latencyMs: Math.round(performanceNow() - start),
+        error: `process exited early (code=${code ?? 'null'} signal=${signal ?? 'null'})`,
+      });
     });
 
     child.stderr.on('data', () => { /* swallow noise */ });
@@ -82,124 +106,87 @@ function probeStdio(spec, timeoutMs) {
         buffer = buffer.slice(nl + 1);
         if (!line) continue;
         let msg;
-        try { msg = JSON.parse(line); } catch (_) { continue; }
-        if (msg.id === 1 && msg.result) {
-          clearTimeout(timer);
-          finish(null);
+        try { msg = JSON.parse(line); } catch (_e) { continue; }
+        if (msg && msg.id === 1 && msg.result) {
+          finish({
+            ok: true,
+            latencyMs: Math.round(performanceNow() - start),
+            error: null,
+            capabilities: msg.result.capabilities ?? null,
+          });
           return;
         }
-        if (msg.id === 1 && msg.error) {
-          clearTimeout(timer);
-          finish(new Error(`initialize returned error: ${msg.error.message || 'unknown'}`));
+        if (msg && msg.id === 1 && msg.error) {
+          finish({
+            ok: false,
+            latencyMs: Math.round(performanceNow() - start),
+            error: `initialize error: ${msg.error.message ?? 'unknown'}`,
+          });
           return;
         }
       }
     });
 
-    child.stdin.write(JSON.stringify(initializeRequest()) + '\n');
+    try {
+      child.stdin.write(JSON.stringify(buildInitRequest()) + '\n');
+    } catch (e) {
+      finish({
+        ok: false,
+        latencyMs: Math.round(performanceNow() - start),
+        error: `stdin write failed: ${e.message}`,
+      });
+    }
   });
 }
 
-// --- http probing ----------------------------------------------------------
-
-function probeHttp(spec, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    let url;
-    try { url = new URL(spec.url); } catch (e) { return reject(new Error(`bad url: ${spec.url}`)); }
-
-    const lib = url.protocol === 'https:' ? https : http;
-    const body = JSON.stringify(initializeRequest());
-
-    const req = lib.request(
-      {
-        method: 'POST',
-        hostname: url.hostname,
-        port: url.port || (url.protocol === 'https:' ? 443 : 80),
-        path: url.pathname + url.search,
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json, text/event-stream',
-          'Content-Length': Buffer.byteLength(body),
-          ...(spec.headers || {}),
-        },
-        timeout: timeoutMs,
+async function probeHttp(server, timeoutMs) {
+  const start = performanceNow();
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  timer.unref?.();
+  try {
+    const res = await fetch(server.url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
       },
-      (res) => {
-        let buf = '';
-        res.on('data', (c) => { buf += c.toString('utf8'); if (buf.length > 64 * 1024) res.destroy(); });
-        res.on('end', () => {
-          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 400) {
-            // best effort: any 2xx/3xx with non-empty body counts as up
-            if (buf.length > 0) return resolve();
-            return reject(new Error(`empty response (status ${res.statusCode})`));
-          }
-          reject(new Error(`http status ${res.statusCode}`));
-        });
-        res.on('error', (e) => reject(new Error(`response error: ${e.message}`)));
-      }
-    );
-    req.on('timeout', () => { req.destroy(new Error(`http probe timed out after ${timeoutMs}ms`)); });
-    req.on('error', (e) => reject(new Error(`request error: ${e.message}`)));
-    req.write(body);
-    req.end();
-  });
+      body: JSON.stringify(buildInitRequest()),
+      signal: ac.signal,
+    });
+    const latencyMs = Math.round(performanceNow() - start);
+    if (!res.ok) {
+      return { ok: false, latencyMs, error: `http status ${res.status}` };
+    }
+    let payload = null;
+    try {
+      payload = await res.json();
+    } catch (_e) {
+      // Non-JSON body still counts as a successful round trip;
+      // some servers reply with SSE framing for `initialize`.
+      return { ok: true, latencyMs, error: null, capabilities: null };
+    }
+    if (payload && payload.error) {
+      return { ok: false, latencyMs, error: `initialize error: ${payload.error.message ?? 'unknown'}` };
+    }
+    return {
+      ok: true,
+      latencyMs,
+      error: null,
+      capabilities: payload?.result?.capabilities ?? null,
+    };
+  } catch (e) {
+    const latencyMs = Math.round(performanceNow() - start);
+    if (e?.name === 'AbortError') {
+      return { ok: false, latencyMs, error: `http probe timed out after ${timeoutMs}ms` };
+    }
+    return { ok: false, latencyMs, error: `http error: ${e.message}` };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-// --- sse probing -----------------------------------------------------------
-
-function probeSse(spec, timeoutMs) {
-  // SSE check: open the connection, look for at least one event chunk, then close.
-  return new Promise((resolve, reject) => {
-    let url;
-    try { url = new URL(spec.url); } catch (e) { return reject(new Error(`bad url: ${spec.url}`)); }
-    const lib = url.protocol === 'https:' ? https : http;
-
-    const req = lib.request(
-      {
-        method: 'GET',
-        hostname: url.hostname,
-        port: url.port || (url.protocol === 'https:' ? 443 : 80),
-        path: url.pathname + url.search,
-        headers: { 'Accept': 'text/event-stream', ...(spec.headers || {}) },
-        timeout: timeoutMs,
-      },
-      (res) => {
-        if (!res.statusCode || res.statusCode >= 400) {
-          res.destroy();
-          return reject(new Error(`sse status ${res.statusCode}`));
-        }
-        let received = false;
-        res.on('data', () => {
-          if (received) return;
-          received = true;
-          res.destroy();
-          resolve();
-        });
-        res.on('end', () => {
-          if (!received) reject(new Error('sse ended with no data'));
-        });
-        res.on('error', (e) => reject(new Error(`sse response error: ${e.message}`)));
-      }
-    );
-    req.on('timeout', () => req.destroy(new Error(`sse probe timed out after ${timeoutMs}ms`)));
-    req.on('error', (e) => reject(new Error(`sse request error: ${e.message}`)));
-    req.end();
-  });
+function performanceNow() {
+  // Node 20+ exposes globalThis.performance.now()
+  return globalThis.performance?.now?.() ?? Date.now();
 }
-
-// --- helpers ---------------------------------------------------------------
-
-function initializeRequest() {
-  return {
-    jsonrpc: '2.0',
-    id: 1,
-    method: 'initialize',
-    params: {
-      protocolVersion: '2025-03-26',
-      capabilities: {},
-      clientInfo: { name: 'mcp-pulse', version: '0.1.0' },
-    },
-  };
-}
-
-module.exports = { probeServer, initializeRequest };

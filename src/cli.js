@@ -1,104 +1,181 @@
 #!/usr/bin/env node
-'use strict';
+// mcp-pulse CLI entry.
+//
+// Subcommands:
+//   watch <config.json> [--interval=<sec>] [--json]
+//   check <config.json> [--json]
+//
+// Args are parsed by hand to keep the project zero-dependency.
 
-const { checkOnce } = require('./index');
-const { renderTable } = require('./render');
+import { loadConfig } from './config.js';
+import { probeServer } from './probe.js';
+import { RollingStore } from './store.js';
+import { renderTable, renderJson } from './report.js';
+
+const VERSION = '0.1.0';
+
+const HELP = `mcp-pulse v${VERSION}
+Watch a fleet of MCP servers and report health, latency, and uptime.
+
+Usage:
+  mcp-pulse watch <config.json> [--interval=<sec>] [--json]
+  mcp-pulse check <config.json> [--json]
+  mcp-pulse --help
+  mcp-pulse --version
+
+Commands:
+  watch   Probe servers on a loop and print a rolling status table.
+  check   Run one probe pass; exit 0 if all healthy, 1 if any down.
+
+Options:
+  --interval=<sec>  Watch interval in seconds (default: 10).
+  --json            Emit JSON instead of an ANSI table.
+  --help            Show this help.
+  --version         Print version and exit.
+`;
 
 function parseArgs(argv) {
-  const args = { _: [], flags: {} };
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a.startsWith('--')) {
-      const key = a.slice(2);
-      const next = argv[i + 1];
-      if (!next || next.startsWith('--')) {
-        args.flags[key] = true;
+  const out = { positional: [], flags: {} };
+  for (const tok of argv) {
+    if (tok.startsWith('--')) {
+      const eq = tok.indexOf('=');
+      if (eq >= 0) {
+        out.flags[tok.slice(2, eq)] = tok.slice(eq + 1);
       } else {
-        args.flags[key] = next;
-        i++;
+        out.flags[tok.slice(2)] = true;
       }
     } else {
-      args._.push(a);
+      out.positional.push(tok);
     }
   }
-  return args;
+  return out;
 }
 
-function usage() {
-  return [
-    'mcp-pulse  -  monitor health of MCP servers',
-    '',
-    'Usage:',
-    '  mcp-pulse check  [--config <path>] [--store <path>] [--slow <ms>] [--timeout <ms>] [--json]',
-    '  mcp-pulse watch  [--interval <sec>] [other check options]',
-    '  mcp-pulse help',
-    '',
-    'Options:',
-    '  --config <path>   Custom config file (otherwise auto-discover)',
-    '  --store  <path>   History file (default: ~/.mcp-pulse/history.jsonl)',
-    '  --slow   <ms>     Latency threshold for "slow" status (default: 1000)',
-    '  --timeout <ms>    Per-probe timeout (default: 5000)',
-    '  --interval <sec>  Watch interval (default: 30)',
-    '  --json            Print JSON instead of a table',
-  ].join('\n');
+async function probeAll(config) {
+  // Probe in parallel; each probe already has its own timeout, so
+  // Promise.all is bounded by the slowest server's timeoutMs.
+  return Promise.all(
+    config.servers.map(async (server) => {
+      const result = await probeServer(server);
+      return { server, result, ts: Date.now() };
+    }),
+  );
 }
 
-async function runCheck(flags) {
-  const opts = {
-    configPath: flags.config || null,
-    storePath: flags.store || null,
-    slowMs: flags.slow ? Number(flags.slow) : 1000,
-    timeoutMs: flags.timeout ? Number(flags.timeout) : 5000,
-  };
-  const rows = await checkOnce(opts);
+async function runCheck(configPath, flags) {
+  const config = await loadConfig(configPath);
+  const store = new RollingStore({ window: 1 });
+  const probes = await probeAll(config);
+  for (const { server, result, ts } of probes) {
+    store.record(server.name, { ts, ok: result.ok, latencyMs: result.latencyMs, error: result.error });
+  }
+  const summaries = store.summaries();
   if (flags.json) {
-    process.stdout.write(JSON.stringify(rows, null, 2) + '\n');
+    process.stdout.write(renderJson(summaries) + '\n');
   } else {
-    if (!rows.length) {
-      console.error('no MCP servers found in any config. pass --config <path> or set up an MCP-compatible client first.');
-      process.exitCode = 2;
-      return;
-    }
-    process.stdout.write(renderTable(rows) + '\n');
+    process.stdout.write(renderTable(summaries) + '\n');
   }
-  if (rows.some((r) => r.status === 'down')) {
-    process.exitCode = 1;
-  }
+  const anyDown = summaries.some((s) => !s.lastOk);
+  process.exit(anyDown ? 1 : 0);
 }
 
-async function runWatch(flags) {
-  const interval = Math.max(2, Number(flags.interval || 30));
+async function runWatch(configPath, flags) {
+  const config = await loadConfig(configPath);
+  const intervalSec = clampInterval(flags.interval);
+  const store = new RollingStore({ window: 100 });
+
   let stopping = false;
-  process.on('SIGINT', () => { stopping = true; console.log('\nstopping'); });
+  const onSignal = () => {
+    if (stopping) return;
+    stopping = true;
+    process.stdout.write('\nstopping...\n');
+  };
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
 
   while (!stopping) {
-    process.stdout.write('c'); // clear screen
-    process.stdout.write(`mcp-pulse watch  -  every ${interval}s  -  Ctrl+C to stop\n\n`);
-    try {
-      await runCheck(flags);
-    } catch (e) {
-      console.error('watch tick failed:', e.message);
+    const probes = await probeAll(config);
+    for (const { server, result, ts } of probes) {
+      store.record(server.name, { ts, ok: result.ok, latencyMs: result.latencyMs, error: result.error });
+    }
+    const summaries = store.summaries();
+    if (flags.json) {
+      process.stdout.write(renderJson(summaries) + '\n');
+    } else {
+      // Clear screen + cursor to top so the table refreshes in place.
+      process.stdout.write('\x1b[2J\x1b[H');
+      process.stdout.write(`mcp-pulse v${VERSION} - watching ${config.servers.length} server(s) every ${intervalSec}s - Ctrl+C to stop\n\n`);
+      process.stdout.write(renderTable(summaries) + '\n');
     }
     if (stopping) break;
-    await new Promise((r) => setTimeout(r, interval * 1000));
+    await sleep(intervalSec * 1000, () => stopping);
   }
+  process.exit(0);
+}
+
+function clampInterval(raw) {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return 10;
+  // Clamp to a sane range; most users want 1s..1h.
+  return Math.max(1, Math.min(3600, Math.floor(n)));
+}
+
+function sleep(ms, shouldAbort = () => false) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const tick = () => {
+      if (shouldAbort()) return resolve();
+      const elapsed = Date.now() - start;
+      if (elapsed >= ms) return resolve();
+      const remaining = Math.min(250, ms - elapsed);
+      setTimeout(tick, remaining).unref?.();
+    };
+    tick();
+  });
 }
 
 async function main(argv) {
   const args = parseArgs(argv);
-  const cmd = args._[0] || 'help';
-  if (cmd === 'help' || args.flags.help) {
-    console.log(usage());
+
+  if (args.flags.help || args.flags.h) {
+    process.stdout.write(HELP);
     return;
   }
-  if (cmd === 'check') return runCheck(args.flags);
-  if (cmd === 'watch') return runWatch(args.flags);
-  console.error(`unknown command: ${cmd}\n`);
-  console.error(usage());
-  process.exitCode = 64;
+  if (args.flags.version || args.flags.v) {
+    process.stdout.write(VERSION + '\n');
+    return;
+  }
+
+  const cmd = args.positional[0];
+  const configPath = args.positional[1];
+
+  if (!cmd) {
+    process.stdout.write(HELP);
+    process.exit(0);
+  }
+
+  if (cmd === 'check') {
+    if (!configPath) {
+      process.stderr.write('mcp-pulse check: missing <config.json> argument\n');
+      process.exit(2);
+    }
+    return runCheck(configPath, args.flags);
+  }
+
+  if (cmd === 'watch') {
+    if (!configPath) {
+      process.stderr.write('mcp-pulse watch: missing <config.json> argument\n');
+      process.exit(2);
+    }
+    return runWatch(configPath, args.flags);
+  }
+
+  process.stderr.write(`mcp-pulse: unknown command "${cmd}"\n\n`);
+  process.stderr.write(HELP);
+  process.exit(64);
 }
 
 main(process.argv.slice(2)).catch((e) => {
-  console.error('fatal:', e && e.stack ? e.stack : e);
-  process.exitCode = 1;
+  process.stderr.write(`mcp-pulse: ${e?.message ?? e}\n`);
+  process.exit(1);
 });

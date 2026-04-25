@@ -1,106 +1,92 @@
-'use strict';
+// Config loader for mcp-pulse.
+//
+// A config file is plain JSON of the shape:
+//   { servers: [ { name, transport, command?, args?, url?, timeoutMs? } ] }
+//
+// `loadConfig(path)` reads the file, validates it, and returns the parsed
+// object. It throws a clear error if anything is missing or malformed so
+// the CLI can surface a useful message.
 
-const fs = require('fs').promises;
-const path = require('path');
-const os = require('os');
+import { readFile } from 'node:fs/promises';
 
-/**
- * Default locations to search for MCP server configs across common tools.
- * Each entry has a `path` and a `style` so we know how to parse it.
- */
-const DEFAULT_LOCATIONS = [
-  { style: 'claude', path: path.join(os.homedir(), 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json') },
-  { style: 'claude', path: path.join(os.homedir(), '.config', 'Claude', 'claude_desktop_config.json') },
-  { style: 'cursor', path: path.join(os.homedir(), '.cursor', 'mcp.json') },
-  { style: 'cursor', path: path.join(os.homedir(), '.config', 'cursor', 'mcp.json') },
-  { style: 'cline',  path: path.join(os.homedir(), '.cline', 'mcp_settings.json') },
-  { style: 'windsurf', path: path.join(os.homedir(), '.windsurf', 'mcp_config.json') },
-  { style: 'zed',    path: path.join(os.homedir(), '.config', 'zed', 'settings.json') },
-];
+const VALID_TRANSPORTS = new Set(['stdio', 'http']);
 
-/**
- * Load a config object of the shape:
- *   { servers: { <name>: { transport, command|url, args?, env? } } }
- *
- * If `configPath` is provided we trust it and parse directly.
- * Otherwise, we walk the default locations and merge any servers we find,
- * with the first-seen name winning on conflict.
- */
-async function loadConfig(configPath) {
-  if (configPath) {
-    const raw = await fs.readFile(configPath, 'utf8');
-    const parsed = JSON.parse(raw);
-    return normalize(parsed, 'custom');
+export async function loadConfig(path) {
+  if (typeof path !== 'string' || !path.length) {
+    throw new Error('loadConfig: a config path is required');
   }
-
-  const merged = { servers: {} };
-  for (const loc of DEFAULT_LOCATIONS) {
-    let raw;
-    try {
-      raw = await fs.readFile(loc.path, 'utf8');
-    } catch (_e) {
-      continue;
-    }
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (_e) {
-      continue;
-    }
-    const norm = normalize(parsed, loc.style);
-    for (const [name, spec] of Object.entries(norm.servers)) {
-      if (!(name in merged.servers)) {
-        merged.servers[name] = spec;
-      }
-    }
+  let raw;
+  try {
+    raw = await readFile(path, 'utf8');
+  } catch (e) {
+    throw new Error(`loadConfig: cannot read ${path}: ${e.message}`);
   }
-  return merged;
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`loadConfig: invalid JSON in ${path}: ${e.message}`);
+  }
+  return validateConfig(parsed, path);
 }
 
-/**
- * Normalize different tool config shapes to a single internal format.
- * All tools we currently support use a top-level `mcpServers` object
- * keyed by server name. Inside each entry we look for either
- * `command/args/env` (stdio) or `url`/`type` (http/sse).
- */
-function normalize(parsed, style) {
-  const out = { servers: {} };
-  // Some tools nest under settings, e.g. Zed has top-level "context_servers".
-  const buckets = [
-    parsed.mcpServers,
-    parsed.context_servers,
-    parsed.mcp_servers,
-    parsed.servers,
-  ].filter((b) => b && typeof b === 'object');
+export function validateConfig(parsed, source = 'config') {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`${source}: top-level must be an object`);
+  }
+  if (!Array.isArray(parsed.servers)) {
+    throw new Error(`${source}: missing required field "servers" (array)`);
+  }
+  if (parsed.servers.length === 0) {
+    throw new Error(`${source}: "servers" must contain at least one entry`);
+  }
+  const seen = new Set();
+  const servers = parsed.servers.map((entry, idx) => validateServer(entry, idx, seen, source));
+  return { servers };
+}
 
-  for (const bucket of buckets) {
-    for (const [name, raw] of Object.entries(bucket)) {
-      if (!raw || typeof raw !== 'object') continue;
-      const spec = inferTransport(raw);
-      if (spec) {
-        out.servers[name] = spec;
-      }
+function validateServer(entry, idx, seen, source) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+    throw new Error(`${source}: servers[${idx}] must be an object`);
+  }
+  if (typeof entry.name !== 'string' || !entry.name.length) {
+    throw new Error(`${source}: servers[${idx}] missing required field "name"`);
+  }
+  if (seen.has(entry.name)) {
+    throw new Error(`${source}: duplicate server name "${entry.name}"`);
+  }
+  seen.add(entry.name);
+
+  if (typeof entry.transport !== 'string' || !VALID_TRANSPORTS.has(entry.transport)) {
+    throw new Error(
+      `${source}: servers[${idx}] ("${entry.name}") "transport" must be one of: ${[...VALID_TRANSPORTS].join(', ')}`,
+    );
+  }
+
+  const out = {
+    name: entry.name,
+    transport: entry.transport,
+    timeoutMs: typeof entry.timeoutMs === 'number' && entry.timeoutMs > 0 ? entry.timeoutMs : 5000,
+  };
+
+  if (entry.transport === 'stdio') {
+    if (typeof entry.command !== 'string' || !entry.command.length) {
+      throw new Error(`${source}: servers[${idx}] ("${entry.name}") stdio transport requires "command"`);
     }
+    out.command = entry.command;
+    out.args = Array.isArray(entry.args) ? entry.args.map(String) : [];
+  } else if (entry.transport === 'http') {
+    if (typeof entry.url !== 'string' || !entry.url.length) {
+      throw new Error(`${source}: servers[${idx}] ("${entry.name}") http transport requires "url"`);
+    }
+    try {
+      // eslint-disable-next-line no-new
+      new URL(entry.url);
+    } catch (_e) {
+      throw new Error(`${source}: servers[${idx}] ("${entry.name}") "url" is not a valid URL`);
+    }
+    out.url = entry.url;
   }
 
   return out;
 }
-
-function inferTransport(raw) {
-  if (typeof raw.command === 'string') {
-    return {
-      transport: 'stdio',
-      command: raw.command,
-      args: Array.isArray(raw.args) ? raw.args : [],
-      env: raw.env && typeof raw.env === 'object' ? raw.env : {},
-    };
-  }
-  if (typeof raw.url === 'string') {
-    const t = (raw.type || raw.transport || '').toLowerCase();
-    const transport = t === 'sse' ? 'sse' : 'http';
-    return { transport, url: raw.url, headers: raw.headers || {} };
-  }
-  return null;
-}
-
-module.exports = { loadConfig, DEFAULT_LOCATIONS, normalize };

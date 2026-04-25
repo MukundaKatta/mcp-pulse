@@ -1,8 +1,0 @@
-{
-  "servers": {
-    "echo-stdio":   { "transport": "stdio", "command": "node", "args": ["./examples/fake-mcp-stdio.js"] },
-    "fs-local":     { "transport": "stdio", "command": "npx",  "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"] },
-    "brave-search": { "transport": "http",  "url": "http://localhost:3030/mcp" },
-    "remote-sse":   { "transport": "sse",   "url": "http://localhost:3031/sse" }
-  }
-}
